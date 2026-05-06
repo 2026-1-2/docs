@@ -23,6 +23,7 @@
 ## Answer
 
 ### 결론
+<img width="736" height="454" alt="image" src="https://github.com/user-attachments/assets/b979cff2-76f5-4839-9a76-594f3012f60c" />
 
 **현재 2개 커넥션 구조 자체는 문제없다.** 오히려 장애 격리라는 목적에 부합하는 좋은 설계다.
 유일한 실질적 위험은 **카메라의 RTSP 동시 세션 수 제한**이라는 하드웨어 제약 하나뿐이다.
