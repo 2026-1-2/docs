@@ -439,3 +439,126 @@ exec /app/mediamtx "$YML_FILE"
 ```
 
 이 구조대로라면 처음에 의도하신 대로 커스텀 `.conf` 포맷의 설정들을 읽어들여 안전하게 `mediamtx.yml`을 초기 구성하고, 이후 API를 통한 추가/수정 사항까지 영구적으로 유지할 수 있습니다.
+
+----------
+## Question
+```
+이거 파일 내용이 없을 때 cp를 수행하도록 바꿔야 할 것 같음.
+```
+## Answer
+말씀하신 부분이 맞습니다! 도커에서 볼륨을 마운트할 때, 호스트 쪽에 파일이 없으면 도커가 빈 디렉토리나 빈 파일을 임의로 생성해 버리는 경우가 종종 발생합니다.
+
+단순히 파일 존재 여부(`-f`)만 체크하고 빠져나가면, **내용이 0바이트인 빈 파일일 때도 스크립트가 실행을 멈추고 빈 파일로 MediaMTX를 구동하려다 에러가 날 수 있습니다.**
+
+따라서 스크립트 구조를 "파일이 없거나 파일 크기가 0(빈 파일)일 때만 템플릿 복사 및 파싱을 수행"하는 구조로 묶어주는 것이 훨씬 안전하고 정석적입니다.
+
+쉘 스크립트의 `-s` 옵션(파일이 존재하고 크기가 0보다 큰지 확인)을 활용하여 다음과 같이 수정하면 완벽합니다.
+
+### 수정된 전체 setup.sh 스크립트
+
+```bash
+#!/bin/sh
+
+CONF_DIR="/app/cam_conf"
+YML_ORIG_FILE="/app/mediamtx-template.yml"
+YML_FILE="/app/mediamtx.yml"
+
+# YML_FILE이 존재하지 않거나(!), 크기가 0인 빈 파일(-s)일 경우에만 블록 내부 실행
+if [ ! -s "$YML_FILE" ]; then
+    
+    # 1. 템플릿 파일 복사
+    cp "$YML_ORIG_FILE" "$YML_FILE"
+
+    # 2. conf 파일들을 읽어서 카메라 경로 추가
+    if [ -d "$CONF_DIR" ] && ls "$CONF_DIR"/*.conf 1> /dev/null 2>&1; then
+        for conf_file in "$CONF_DIR"/*.conf; do
+            in_camera_block=0
+            while IFS= read -r line; do
+                line=$(echo "$line" | awk '{$1=$1};1')
+                if [ -z "$line" ] || echo "$line" | grep -q "^#"; then
+                    continue
+                fi
+                
+                if [ "$line" = "camera {" ]; then
+                    in_camera_block=1
+                    cam_name=""
+                    cam_ip=""
+                    cam_port=""
+                    cam_rtsp_path=""
+                    username=""
+                    password=""
+                    continue
+                fi
+                
+                if [ "$in_camera_block" -eq 1 ]; then
+                    if [ "$line" = "}" ]; then
+                        in_camera_block=0
+                        url="rtsp://"
+
+                        if [ -n "$username" ] && [ -n "$password" ]; then
+                            url="${url}${username}:${password}@"
+                        fi
+                        
+                        clean_path=$(echo "$cam_rtsp_path" | sed 's|^/||')
+                        
+                        url="${url}${cam_ip}:${cam_port}/${clean_path}"
+
+                        # 들여쓰기 2칸 유지 (중요)
+                        cat <<EOF >> "$YML_FILE"
+  $cam_name:
+    source: $url
+    rtspTransport: tcp
+    sourceOnDemand: no
+EOF
+                        continue
+                    fi
+                    
+                    key=$(echo "$line" | awk '{print $1}')
+                    val=$(echo "$line" | sed "s/^$key[ \t]*//" | sed 's/;$//')
+                    case "$key" in
+                        cam_name)      cam_name="$val" ;;
+                        cam_ip)        cam_ip="$val" ;;
+                        cam_port)      cam_port="$val" ;;
+                        cam_rtsp_path) cam_rtsp_path="$val" ;;
+                        username)      username="$val" ;;
+                        password)      password="$val" ;;
+                    esac
+                fi
+            done < "$conf_file"
+        done
+    fi
+fi
+
+# 위의 조건문을 거친 후 최종적으로 mediamtx 실행 
+# (기존 파일이 있으면 파싱 블록을 건너뛰고 바로 실행됨)
+exec /app/mediamtx "$YML_FILE"
+
+```
+
+### 주요 변경점
+
+* **`[ ! -s "$YML_FILE" ]` 조건문 사용:** 단순히 `-f`로 파일 유무만 보지 않고, 파일 내용물이 실질적으로 존재하는지(0바이트가 아닌지)까지 확인합니다.
+* **`exec` 위치 이동:** 스크립트 중간에 있던 `exec` 명령을 맨 아래로 내렸습니다. 이렇게 하면 쉘 스크립트의 흐름이 한눈에 들어오고, "설정 구성 -> 서버 실행" 이라는 논리적 순서가 명확해집니다.
+----------
+## Question
+```
+이렇게 하면 되나?
+
+if [ ! -s ${YML_FILE} ]; then
+```
+## Answer
+네, 논리적으로 아주 정확합니다!
+
+`! -s` 옵션을 사용하면 파일이 아예 존재하지 않거나, 존재하더라도 내용이 없는 0바이트 빈 파일일 경우 모두 참(True)으로 판별하기 때문에 의도하신 상황에 완벽하게 들어맞습니다.
+
+한 가지 사소하지만 아주 중요한 쉘 스크립트 작성 팁을 드리자면, **변수를 호출할 때는 큰따옴표(`" "`)로 감싸주는 것이 정석이자 가장 안전한 방법입니다.**
+
+```bash
+# 추천하는 작성 방식
+if [ ! -s "$YML_FILE" ]; then
+
+```
+
+`${YML_FILE}`처럼 괄호를 쓰는 것도 좋지만, 큰따옴표 없이 변수를 사용하면 만약 변수 값에 공백이 포함되어 있거나 변수가 비어있을 때 쉘에서 문법 에러(unexpected operator 등)를 뱉어낼 수 있습니다.
+
+현재 스크립트에서는 경로에 공백이 없어서 큰 문제가 되진 않지만, 호환성과 안정성을 위해 큰따옴표로 묶어주시면 결점 없는 완벽한 코드가 됩니다!
