@@ -562,3 +562,283 @@ if [ ! -s "$YML_FILE" ]; then
 `${YML_FILE}`처럼 괄호를 쓰는 것도 좋지만, 큰따옴표 없이 변수를 사용하면 만약 변수 값에 공백이 포함되어 있거나 변수가 비어있을 때 쉘에서 문법 에러(unexpected operator 등)를 뱉어낼 수 있습니다.
 
 현재 스크립트에서는 경로에 공백이 없어서 큰 문제가 되진 않지만, 호환성과 안정성을 위해 큰따옴표로 묶어주시면 결점 없는 완벽한 코드가 됩니다!
+
+--------
+## Question
+```
+cat <<EOF >> "$YML_FILE"
+  $cam_name:
+    source: $url
+    rtspTransport: tcp
+    sourceOnDemand: no
+EOF
+
+이 구문은 기존 파일 내용을 다 제거하나?
+```
+## Answer
+**아닙니다. 기존 파일 내용을 제거하지 않고 파일 맨 끝에 내용을 이어서 추가(Append)합니다.**
+
+그 이유는 방향 재지정(Redirection) 기호로 **`>>`** 를 사용했기 때문입니다. 쉘 스크립트에서 이 기호들의 차이는 다음과 같습니다.
+
+* **`>>` (이어쓰기):** 기존 파일의 내용을 그대로 유지한 채, 파일의 맨 마지막 줄에 새로운 내용을 덧붙입니다.
+* **`>` (덮어쓰기):** 기존 파일의 내용을 모두 지워버리고(초기화), 완전히 새로운 내용만 씁니다.
+
+따라서 작성하신 스크립트는 복사해 온 템플릿 파일(`mediamtx.yml`)의 기존 설정들(맨 아래의 `paths:` 포함)을 안전하게 유지하면서, 반복문을 돌 때마다 새로운 카메라 설정 블록을 차곡차곡 누적해서 추가하게 됩니다. 의도하신 대로 아주 정확하게 작성된 구문입니다!
+---------------
+## Question
+```
+그런데
+#!/bin/sh
+
+CONF_DIR="/app/cam_conf"
+YML_ORIG_FILE="/app/mediamtx-template.yml"
+YML_FILE="/app/mediamtx.yml"
+
+if [ -s "$YML_FILE" ]; then
+    exec /app/mediamtx "$YML_FILE"
+fi
+
+cp "$YML_ORIG_FILE" "$YML_FILE"
+
+if [ -d "$CONF_DIR" ] && ls "$CONF_DIR"/*.conf 1> /dev/null 2>&1; then
+    for conf_file in "$CONF_DIR"/*.conf; do
+        in_camera_block=0
+        while IFS= read -r line; do
+            line=$(echo "$line" | awk '{$1=$1};1')
+            if [ -z "$line" ] || echo "$line" | grep -q "^#"; then
+                continue
+            fi
+            
+            if [ "$line" = "camera {" ]; then
+                in_camera_block=1
+                cam_name=""
+                cam_ip=""
+                cam_port=""
+                cam_rtsp_path=""
+                username=""
+                password=""
+                continue
+            fi
+            
+            if [ "$in_camera_block" -eq 1 ]; then
+                if [ "$line" = "}" ]; then
+                    in_camera_block=0
+                    url="rtsp://"
+
+                    if [ -n "$username" ] && [ -n "$password" ]; then
+                        url="${url}${username}:${password}@"
+                    fi
+                    
+                    clean_path=$(echo "$cam_rtsp_path" | sed 's|^/||')
+                    
+                    url="${url}${cam_ip}:${cam_port}/${clean_path}"
+
+                    cat <<EOF >> "$YML_FILE"
+  $cam_name:
+    source: $url
+    rtspTransport: tcp
+    sourceOnDemand: no
+EOF
+                    continue
+                fi
+                
+                key=$(echo "$line" | awk '{print $1}')
+                val=$(echo "$line" | sed "s/^$key[ \t]*//" | sed 's/;$//')
+                case "$key" in
+                    cam_name)      cam_name="$val" ;;
+                    cam_ip)        cam_ip="$val" ;;
+                    cam_port)      cam_port="$val" ;;
+                    cam_rtsp_path) cam_rtsp_path="$val" ;;
+                    username)      username="$val" ;;
+                    password)      password="$val" ;;
+                esac
+            fi
+        done < "$conf_file"
+    done
+fi
+
+exec /app/mediamtx "$YML_FILE"
+
+이걸 실행을 했을 때 mediamtx.yml 에는 왜 
+
+  1   Cam-Big-PTZ:
+  2     source: rtsp://admin:cdp2-cam-big@192.168.0.105:554/Streaming/Channels/101
+  3     rtspTransport: tcp
+  4     sourceOnDemand: no
+  5   Cam-Big-Panoramic:
+  6     source: rtsp://admin:cdp2-cam-big@192.168.0.105:554/Streaming/Channels/201
+  7     rtspTransport: tcp
+  8     sourceOnDemand: no
+  9   Cam-Small-PTZ:
+ 10     source: rtsp://admin:cdp2-cam-small@192.168.0.104:554/Streaming/Channels/101
+ 11     rtspTransport: tcp
+ 12     sourceOnDemand: no
+
+
+이것뿐이지?
+```
+## Answer
+현재 현상은 **원본 템플릿 파일(`mediamtx-template.yml`)이 컨테이너 내부에 없거나, 내용이 완전히 비어있을 때 발생하는 전형적인 증상**입니다.
+
+작성하신 쉘 스크립트의 논리적 흐름 자체는 문제가 없습니다. 하지만 파일 복사(`cp`) 단계에서 다음과 같은 일이 벌어진 것입니다.
+
+### 원인 분석
+
+1. **`cp "$YML_ORIG_FILE" "$YML_FILE"` 실행 단계:**
+원본 파일(`/app/mediamtx-template.yml`)이 존재하지 않거나 0바이트로 비어있었을 가능성이 높습니다. 대상 파일(`/app/mediamtx.yml`) 역시 비어있는 상태로 만들어지거나 복사 에러가 발생합니다. (쉘 스크립트는 기본적으로 `cp`에서 에러가 나도 스크립트를 멈추지 않고 다음 줄로 넘어갑니다.)
+2. **`cat <<EOF >> "$YML_FILE"` 실행 단계:**
+`>>` (이어쓰기) 연산자는 대상 파일이 없으면 빈 파일을 새로 생성한 뒤 내용을 기록합니다. 템플릿 내용이 없는 백지상태의 파일에 카메라 설정 블록만 반복해서 덧붙였기 때문에 결과적으로 문의하신 내용만 덩그러니 남게 된 것입니다.
+
+---
+
+### 해결 및 확인 방법
+
+가장 유력한 원인은 **Docker 볼륨 마운트 시 호스트 측의 템플릿 파일 경로가 잘못되었거나 파일이 없는 경우**입니다. Docker는 볼륨 마운트 시 호스트 경로에 대상 파일이 없으면, 에러를 내는 대신 빈 디렉토리나 0바이트 파일을 컨테이너 내부에 임의로 만들어버리는 특징이 있습니다.
+
+**1. 호스트 머신의 원본 파일 내용 확인**
+마운트 변수로 지정하셨던 `${MEDIA_SERVER_CONF_TEMPLATE_PATH}` 경로의 실제 파일에 `api: true`나 `paths:` 같은 기본 설정 내용이 정상적으로 들어있는지 호스트 머신에서 먼저 확인해 주세요.
+
+**2. 마운트 경로 오타 확인**
+`docker-compose.yml` (또는 컨테이너 실행 명령어)의 마운트 경로가 정확한지 확인해 주세요.
+
+```yaml
+volumes:
+  - /정확한/호스트/절대경로/mediamtx-template.yml:/app/mediamtx-template.yml:ro
+
+```
+
+**3. 스크립트에 안전장치 추가 (권장)**
+앞으로 원본 템플릿 파일 마운트가 꼬였을 때 빈 파일에 카메라만 추가되는 상황을 방지하려면, `cp` 명령어 앞뒤로 템플릿 존재 여부를 검증하는 방어 코드를 넣는 것이 좋습니다.
+
+```bash
+# ... 기존 상단 생략 ...
+
+if [ -s "$YML_FILE" ]; then
+    exec /app/mediamtx "$YML_FILE"
+fi
+
+# 템플릿 파일이 없거나 비어있으면 스크립트 에러 뿜고 종료
+if [ ! -s "$YML_ORIG_FILE" ]; then
+    echo "Error: Template file is empty or missing at $YML_ORIG_FILE"
+    exit 1
+fi
+
+cp "$YML_ORIG_FILE" "$YML_FILE"
+
+# ... 이후 conf 파싱 로직 동일 ...
+
+```
+
+템플릿 파일의 내용물만 정상적으로 마운트되어 컨테이너 안으로 전달되면, 지금 작성하신 스크립트 구문대로 템플릿 하단에 카메라 리스트가 예쁘게 잘 이어 붙을 것입니다.
+
+----------------
+## Question
+```
+Dockerfile 에서
+
+ => [stage-1 5/8] COPY mediamtx-template.yml /app/mediamtx-template.yml 
+
+이 로그가 있고
+
+compose 는
+ 78       - "/hdd/mmp-data/mediamtx/mediamtx-template.yml:/app/mediamtx-template.yml:ro"
+이렇게 잡혀 있으면 문제 없는 것 아닌가? Host 에서 해당 파일 존재 여부 확인하였음.
+```
+## Answer
+설정하신 내용의 문법이나 논리적 흐름은 문제가 없습니다. 하지만 도커의 동작 방식에서 자주 겪게 되는 **'마운트로 인한 덮어쓰기(Shadowing)'** 현상 때문에 발생한 문제일 확률이 매우 높습니다.
+
+현재 상황을 도커의 관점에서 분석해보면 다음과 같습니다.
+
+### 1. 충돌 원인: Dockerfile `COPY` vs Compose `Volume`
+
+* **Dockerfile (`COPY`)**: 이미지를 빌드하는 시점에 템플릿 파일을 컨테이너 내부(`/app/mediamtx-template.yml`)로 잘 복사해 넣으셨습니다.
+* **docker-compose (`Volume`)**: 그런데 컨테이너를 구동하는 시점에, 호스트의 `/hdd/mmp-data/mediamtx/mediamtx-template.yml` 파일을 컨테이너의 동일한 경로에 덮어씌우듯 마운트(`:ro`) 하셨습니다.
+
+도커 볼륨 마운트는 기존에 컨테이너 안에 존재하던 파일을 밀어내고 호스트의 파일을 우선하여 덮어씌웁니다. 즉, Dockerfile에서 열심히 복사해 둔 템플릿 내용이 Compose의 마운트 때문에 무시되고 가려져 버린 것입니다.
+
+### 2. 예상되는 현재 상태 (빈 파일 마운트)
+
+호스트 머신에서 해당 파일의 "존재 여부"는 확인하셨지만, **그 파일의 내용물 자체가 비어있는 0바이트(Empty File) 상태일 가능성이 큽니다.** 호스트의 파일이 비어있다면 컨테이너 내부 스크립트는 다음과 같이 동작하게 됩니다.
+
+1. 내용이 없는 빈 원본 템플릿 파일이 `cp`로 복사됨 (`mediamtx.yml`도 0바이트가 됨)
+2. 그 빈 파일에 `cat <<EOF >>` 구문이 카메라 설정만 반복해서 덧붙임
+3. 결과적으로 템플릿 설정(api, paths 등)은 온데간데없고 카메라 리스트만 덩그러니 남게 됨
+
+---
+
+### 해결 방법
+
+현재 두 가지 방식이 중복으로 적용되어 충돌하고 있으므로, 목적에 맞게 둘 중 하나를 선택해서 정리하셔야 합니다.
+
+**방법 A: 호스트 마운트 제거 (Dockerfile 우선)**
+컨테이너 빌드 시점에 이미 템플릿을 구워 넣었으므로, 외부에서 굳이 마운트할 필요가 없습니다.
+
+* `docker-compose.yml` 파일에서 해당 마운트 줄(`- "/hdd/.../mediamtx-template.yml:/app/mediamtx-template.yml:ro"`)을 **삭제**하세요.
+* 이렇게 하면 컨테이너 내부에 원래 있던 온전한 템플릿 파일이 정상적으로 읽힙니다.
+
+**방법 B: 호스트 파일 내용 채우기 (호스트 우선)**
+컨테이너를 다시 빌드하지 않고 호스트 측 파일에서 템플릿을 직접 관리하고 싶다면 마운트를 유지합니다.
+
+* 호스트 쉘에서 `cat /hdd/mmp-data/mediamtx/mediamtx-template.yml` 명령어를 실행하여 파일 안에 `api: true`나 `paths:` 등의 필수 설정들이 텍스트로 잘 들어가 있는지 반드시 확인해 주세요.
+* 0바이트라면 원래 의도했던 템플릿 내용을 파일 안에 직접 채워 넣어 주셔야 합니다.
+
+둘 중 원하시는 운영 방식에 맞춰 하나만 확실하게 정리해 주시면, 템플릿 내용 맨 아래에 카메라 리스트가 완벽하게 이어 붙게 됩니다.
+-----------
+## Question
+```
+if [ -s "$YML_FILE" ]; then
+    exec /app/mediamtx "$YML_FILE"
+fi
+
+이거 없으면 컨테이너 재시작할때마다 paths 에 카메라 설정이 중첩되나?
+```
+## Answer
+결론부터 말씀드리면, 카메라 설정이 **중첩(누적)되지는 않습니다.** 하지만 그보다 더 큰 문제인 **'API로 추가했던 카메라 설정 초기화(삭제)'** 문제가 발생하게 됩니다.
+
+설정이 중첩되지 않는 이유는 스크립트 바로 다음 줄에 있는 복사 명령어 때문입니다.
+
+```bash
+cp "$YML_ORIG_FILE" "$YML_FILE"
+
+```
+
+이 `cp` 명령어는 기존 파일에 내용을 이어 붙이는 것이 아니라, 기존 파일을 원본 템플릿으로 완전히 **덮어쓰기(Overwrite)** 합니다.
+
+따라서 해당 `if` 블록을 지우고 컨테이너를 재시작하면 다음과 같은 과정이 반복됩니다.
+
+1. `cp` 명령어가 실행되어 기존 `mediamtx.yml` 파일을 깨끗한 템플릿 파일로 덮어씌워 초기화함. (**이때 구동 중에 API로 추가해 두었던 카메라 설정들이 모두 날아갑니다.**)
+2. 아래의 `for` 루프가 돌면서 `.conf` 파일에 적혀있는 카메라들만 초기화된 템플릿 밑에 다시 작성함.
+
+즉, 파일 내용이 계속 길어지는 중첩 현상은 일어나지 않지만, 애초에 우리가 의도했던 **"프로그램을 재시작해도 API로 동적 추가한 카메라 정보를 영구적으로 유지한다"는 목적이 깨지게 됩니다.**
+
+해당 `if` 블록(`if [ -s "$YML_FILE" ]; then exec ...`)은 "이미 파일이 존재하면(API 변경점이 저장되어 있으면) 템플릿 덮어쓰기 초기화 과정을 건너뛰고 바로 실행하라"는 핵심 방어벽 역할을 하므로 반드시 남겨두셔야 합니다.
+
+-------
+## Question
+```
+지금 계속 template.yml 파일이 복사되지 않고 있음.
+DOckerfile 이 문제인가?
+
+  1 FROM golang:1.26-alpine AS builder
+  2 RUN apk add --no-cache git build-base
+  3 WORKDIR /build
+  4 COPY . .
+  5 RUN go generate ./...
+  6 RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o mediamtx .
+  7
+  8 FROM alpine:3.19
+  9 WORKDIR /app
+ 10 RUN apk add --no-cache tzdata ca-certificates
+ 11 COPY --from=builder /build/mediamtx /app/mediamtx
+ 12 COPY mediamtx-template.yml /app/mediamtx-template.yml
+ 13 COPY setup.sh /app/setup.sh
+ 14 RUN chmod +x /app/mediamtx
+ 15 RUN chmod +x /app/setup.sh
+ 16 EXPOSE 8554 8889 8189/tcp 8189/udp 9997
+ 17 ENTRYPOINT [ "/app/setup.sh" ]
+
+compose 에서는 template 에 대한 마운트를 해제하였음.
+또한, github 에서 clone 받아서 해봐도 동일하네. 참고로, clone 받은 파일에는 0바이트의 mediamtx.yml 파일이 있음.
+```
+## Answer
+
