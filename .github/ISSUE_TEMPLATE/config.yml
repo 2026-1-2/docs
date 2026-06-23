@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 브랜치 / Issue / PR 컨벤션
+    url: https://github.com/2026-1-2/docs/blob/main/브랜치_Issue_PR_컨벤션.md
+    about: 이슈/PR을 작성하기 전에 협업 컨벤션을 확인하세요.
